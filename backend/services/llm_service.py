@@ -48,12 +48,17 @@ class LLMService:
         # Get browsed products details
         browsed_products = self._get_browsed_products(browsing_history, all_products)
         
-        # Determine the approach based on available data and services
-        if self.use_embeddings and browsed_products:
-            # Use RAG approach with embeddings
+        # Determine the approach based on available data and services.
+        # Embeddings work from browsing history, explicit preferences, or both (cold start).
+        relevant_products = []
+        approach = 'standard'
+        if self.use_embeddings and (browsed_products or self._has_preferences(user_preferences)):
             relevant_products = self._find_relevant_products_with_embeddings(
                 user_preferences, browsed_products, all_products
             )
+
+        if relevant_products:
+            approach = 'rag'
             prompt = self._create_rag_enhanced_prompt(
                 user_preferences, browsed_products, relevant_products, num_recommendations
             )
@@ -68,13 +73,16 @@ class LLMService:
         
         # Call the LLM API with retry logic
         try:
-            recommendations = self._call_llm_with_retry(prompt, all_products)
-            
+            # Only accept IDs we actually offered, and never items the user already browsed
+            browsed_ids = {p['id'] for p in browsed_products}
+            allowed_ids = {p['id'] for p in relevant_products} - browsed_ids
+            recommendations = self._call_llm_with_retry(prompt, all_products, allowed_ids)
+
             # Add timing information for performance analysis
             process_time = time.time() - start_time
             recommendations['metadata'] = {
                 'process_time': process_time,
-                'approach': 'rag' if self.use_embeddings and browsed_products else 'standard',
+                'approach': approach,
                 'prompt_tokens': len(prompt) // 4,  # Approximate token count
                 'relevant_products_count': len(relevant_products)
             }
@@ -108,18 +116,25 @@ class LLMService:
         """
         if not self.embedding_service:
             return self._prefilter_products(user_preferences, browsed_products, all_products, max_products)
-        
+
+        # Index covers the full catalog; filters are applied at query time
+        self.embedding_service.ensure_index(all_products)
+
         # Apply basic filtering first to reduce the candidate pool
         filtered_products = self._apply_basic_filters(user_preferences, all_products)
-        
+
         # Get IDs of products already browsed to exclude them
         browsed_ids = [p['id'] for p in browsed_products]
-        
+
         # Get user interest embedding (combining browsing history and preferences)
         user_embedding = self.embedding_service.get_user_interests_embedding(
             browsed_products, user_preferences
         )
-        
+
+        # No usable embedding (e.g. API failure) -> let caller fall back to rule-based filtering
+        if user_embedding is None:
+            return []
+
         # Find similar products using embeddings
         similar_products = self.embedding_service.find_similar_products(
             user_embedding, 
@@ -141,40 +156,55 @@ class LLMService:
         
         return relevant_products[:max_products]
     
+    @staticmethod
+    def _get_pref_list(user_preferences, *keys):
+        """
+        Read a list-valued preference, accepting several key names.
+        The frontend stores 'category_preferences' / 'brand_preferences';
+        older callers may send 'category' / 'brand'.
+        """
+        for key in keys:
+            value = user_preferences.get(key)
+            if value:
+                return [value] if isinstance(value, str) else list(value)
+        return []
+
+    def _has_preferences(self, user_preferences):
+        """True if the user has any explicit preference set"""
+        return bool(
+            self._get_pref_list(user_preferences, 'category_preferences', 'category') or
+            self._get_pref_list(user_preferences, 'brand_preferences', 'brand') or
+            any(v is not None for v in (user_preferences.get('price_range') or {}).values())
+        )
+
     def _apply_basic_filters(self, user_preferences, products):
         """
         Apply basic filtering based on user preferences
         """
         filtered_products = products.copy()
-        
+        price_range = user_preferences.get('price_range') or {}
+
         # Filter by category if specified
-        if 'category' in user_preferences and user_preferences['category']:
-            categories = user_preferences['category']
-            if isinstance(categories, str):
-                categories = [categories]
+        categories = self._get_pref_list(user_preferences, 'category_preferences', 'category')
+        if categories:
             filtered_products = [p for p in filtered_products if p.get('category') in categories]
-        
+
         # Filter by price range if specified
-        if 'price_range' in user_preferences:
-            price_range = user_preferences['price_range']
-            if 'min' in price_range and price_range['min'] is not None:
-                filtered_products = [p for p in filtered_products if p.get('price', 0) >= price_range['min']]
-            if 'max' in price_range and price_range['max'] is not None:
-                filtered_products = [p for p in filtered_products if p.get('price', 0) <= price_range['max']]
-        
+        if price_range.get('min') is not None:
+            filtered_products = [p for p in filtered_products if p.get('price', 0) >= price_range['min']]
+        if price_range.get('max') is not None:
+            filtered_products = [p for p in filtered_products if p.get('price', 0) <= price_range['max']]
+
         # Filter by brand if specified
-        if 'brand' in user_preferences and user_preferences['brand']:
-            brands = user_preferences['brand']
-            if isinstance(brands, str):
-                brands = [brands]
+        brands = self._get_pref_list(user_preferences, 'brand_preferences', 'brand')
+        if brands:
             filtered_products = [p for p in filtered_products if p.get('brand') in brands]
-        
+
         # If we've filtered too aggressively, restore some products
         if len(filtered_products) < 10:
             # Just apply the price filter as a fallback
             filtered_products = products.copy()
-            if 'price_range' in user_preferences:
-                price_range = user_preferences['price_range']
+            if price_range:
                 if 'min' in price_range and price_range['min'] is not None:
                     filtered_products = [p for p in filtered_products if p.get('price', 0) >= price_range['min']]
                 if 'max' in price_range and price_range['max'] is not None:
@@ -596,7 +626,7 @@ class LLMService:
         
         return prompt
     
-    def _call_llm_with_retry(self, prompt, all_products, max_retries=2):
+    def _call_llm_with_retry(self, prompt, all_products, allowed_ids=None, max_retries=2):
         """
         Call the LLM API with retry logic
         """
@@ -616,8 +646,9 @@ class LLMService:
                 
                 # Parse the LLM response to extract recommendations
                 recommendations = self._parse_recommendation_response(
-                    response.choices[0].message.content, 
-                    all_products
+                    response.choices[0].message.content,
+                    all_products,
+                    allowed_ids
                 )
                 
                 # If we successfully parsed recommendations, return them
@@ -643,10 +674,13 @@ class LLMService:
                     raise
                 time.sleep(1)  # Short delay before retry
     
-    def _parse_recommendation_response(self, llm_response, all_products):
+    def _parse_recommendation_response(self, llm_response, all_products, allowed_ids=None):
         """
-        Parse the LLM response to extract product recommendations
+        Parse the LLM response to extract product recommendations.
+        If allowed_ids is given, IDs outside it (hallucinated, not offered as
+        candidates, or already browsed) are dropped, as are duplicates.
         """
+        json_str = ''
         try:
             # Find JSON content in the response using regex
             json_pattern = r'\[\s*{.*}\s*\]'
@@ -678,9 +712,16 @@ class LLMService:
             
             # Enrich recommendations with full product details
             recommendations = []
+            seen_ids = set()
             for rec in rec_data:
                 product_id = rec.get('product_id')
-                
+
+                if product_id in seen_ids:
+                    continue
+                if allowed_ids is not None and product_id not in allowed_ids:
+                    continue
+                seen_ids.add(product_id)
+
                 # Find the product in the lookup dictionary
                 product_details = product_lookup.get(product_id)
                 
