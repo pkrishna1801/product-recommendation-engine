@@ -1,10 +1,12 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import logging
+import threading
 from functools import wraps
 from services.llm_service import LLMService
 from services.product_service import ProductService
 from services.user_service import UserService
+from services.email_service import EmailService
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +20,18 @@ CORS(app)  # Enable Cross-Origin Resource Sharing
 product_service = ProductService()
 llm_service = LLMService()
 user_service = UserService()
+email_service = EmailService()
+
+# Warm the embedding index in the background at boot so the first
+# recommendation request after a dyno restart doesn't hit Heroku's 30s timeout
+def _warm_embedding_index():
+    try:
+        llm_service.embedding_service.ensure_index(product_service.get_all_products())
+        logger.info("Embedding index warmed")
+    except Exception as e:
+        logger.error(f"Failed to warm embedding index: {str(e)}")
+
+threading.Thread(target=_warm_embedding_index, daemon=True).start()
 
 # Authentication decorator
 def token_required(f):
@@ -71,6 +85,8 @@ def register():
         )
         
         if result['success']:
+            # Fire-and-forget: a mail failure never fails registration
+            email_service.send_welcome_email(result['user']['email'], result['user']['username'])
             return jsonify(result), 201
         else:
             return jsonify(result), 400
